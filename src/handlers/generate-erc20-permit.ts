@@ -12,6 +12,73 @@ export interface Payload {
   issueNodeId: string;
   logger: Logger;
   userId: number;
+  transfer?: boolean;
+  kernelFeeRate?: number;
+  kernelFeeRecipient?: string;
+}
+
+const DEFAULT_KERNEL_FEE_RECIPIENT = "ubq.eth";
+
+interface ResolvedPermitInput {
+  logger: Logger;
+  walletAddress: string | null | undefined;
+  issueNodeId: string;
+  evmNetworkId: number;
+  evmPrivateEncrypted: string;
+  userId: number;
+  shouldTransfer: boolean;
+  kernelFeeRate: number;
+  kernelFeeRecipient: string;
+}
+
+function resolveEnvFeeRate(value: unknown): number {
+  const raw = value ?? process.env.KERNEL_FEE_RATE;
+  const parsed = raw !== undefined ? Number(raw) : 0;
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function resolveIssueNodeId(payload: Context["payload"]): string {
+  if ("issue" in payload) {
+    return payload.issue.node_id;
+  }
+  if ("pull_request" in payload) {
+    return payload.pull_request.node_id;
+  }
+  throw new Error("Issue Id is missing");
+}
+
+async function resolvePermitInput(contextOrPayload: Context | Payload, username: string): Promise<ResolvedPermitInput> {
+  if ("issueNodeId" in contextOrPayload) {
+    return {
+      logger: contextOrPayload.logger,
+      walletAddress: contextOrPayload.walletAddress,
+      evmNetworkId: contextOrPayload.evmNetworkId,
+      evmPrivateEncrypted: contextOrPayload.evmPrivateEncrypted,
+      issueNodeId: contextOrPayload.issueNodeId,
+      userId: contextOrPayload.userId,
+      shouldTransfer: Boolean(contextOrPayload.transfer),
+      kernelFeeRate: resolveEnvFeeRate(contextOrPayload.kernelFeeRate),
+      kernelFeeRecipient: contextOrPayload.kernelFeeRecipient ?? process.env.KERNEL_FEE_RECIPIENT ?? DEFAULT_KERNEL_FEE_RECIPIENT,
+    };
+  }
+
+  const { config, logger } = contextOrPayload;
+  const { data: userData } = await contextOrPayload.octokit.rest.users.getByUsername({ username });
+  if (!userData) {
+    throw new Error(`GitHub user was not found for id ${username}`);
+  }
+  const walletAddress = await contextOrPayload.adapters.supabase.wallet.getWalletByUserId(userData.id);
+  return {
+    logger,
+    walletAddress,
+    evmNetworkId: config.evmNetworkId,
+    evmPrivateEncrypted: config.evmPrivateEncrypted,
+    issueNodeId: resolveIssueNodeId(contextOrPayload.payload),
+    userId: userData.id,
+    shouldTransfer: Boolean(config.transfer),
+    kernelFeeRate: resolveEnvFeeRate(contextOrPayload.env?.KERNEL_FEE_RATE),
+    kernelFeeRecipient: contextOrPayload.env?.KERNEL_FEE_RECIPIENT ?? process.env.KERNEL_FEE_RECIPIENT ?? DEFAULT_KERNEL_FEE_RECIPIENT,
+  };
 }
 
 export async function generateErc20PermitSignature(payload: Payload, username: string, amount: number, tokenAddress: string): Promise<PermitReward>;
@@ -22,44 +89,19 @@ export async function generateErc20PermitSignature(
   amount: number,
   tokenAddress: string
 ): Promise<PermitReward> {
-  let logger: Logger;
-  const _username = username;
-  let walletAddress: string | null | undefined;
-  let issueNodeId: string;
-  let evmNetworkId: number;
-  let evmPrivateEncrypted: string;
-  let userId: number;
+  const {
+    logger,
+    walletAddress,
+    issueNodeId,
+    evmNetworkId,
+    evmPrivateEncrypted,
+    userId,
+    shouldTransfer,
+    kernelFeeRate,
+    kernelFeeRecipient,
+  } = await resolvePermitInput(contextOrPayload, username);
 
-  if ("issueNodeId" in contextOrPayload) {
-    logger = contextOrPayload.logger as Logger;
-    walletAddress = contextOrPayload.walletAddress;
-    evmNetworkId = contextOrPayload.evmNetworkId;
-    evmPrivateEncrypted = contextOrPayload.evmPrivateEncrypted;
-    issueNodeId = contextOrPayload.issueNodeId;
-    userId = contextOrPayload.userId;
-  } else {
-    const config = contextOrPayload.config;
-    logger = contextOrPayload.logger;
-    const { evmNetworkId: configEvmNetworkId, evmPrivateEncrypted: configEvmPrivateEncrypted } = config;
-    const { data: userData } = await contextOrPayload.octokit.rest.users.getByUsername({ username: _username });
-    if (!userData) {
-      throw new Error(`GitHub user was not found for id ${_username}`);
-    }
-    userId = userData.id;
-    const { wallet } = contextOrPayload.adapters.supabase;
-    walletAddress = await wallet.getWalletByUserId(userId);
-    evmNetworkId = configEvmNetworkId;
-    evmPrivateEncrypted = configEvmPrivateEncrypted;
-    if ("issue" in contextOrPayload.payload) {
-      issueNodeId = contextOrPayload.payload.issue.node_id;
-    } else if ("pull_request" in contextOrPayload.payload) {
-      issueNodeId = contextOrPayload.payload.pull_request.node_id;
-    } else {
-      throw new Error("Issue Id is missing");
-    }
-  }
-
-  if (!_username) {
+  if (!username) {
     throw new Error("User was not found");
   }
   if (!walletAddress) {
@@ -107,11 +149,111 @@ export async function generateErc20PermitSignature(
 
     logger.info("Generated ERC20 permit2 signature", erc20Permit);
 
+    if (shouldTransfer) {
+      const transferResult = await executeAutomaticErc20Transfer(
+        adminWallet,
+        provider,
+        tokenAddress,
+        walletAddress,
+        ethers.BigNumber.from(permitTransferFromData.permitted.amount),
+        kernelFeeRate,
+        kernelFeeRecipient,
+        logger
+      );
+      erc20Permit.transactionHash = transferResult.transactionHash;
+      if (transferResult.feeTransactionHash) {
+        erc20Permit.feeTransactionHash = transferResult.feeTransactionHash;
+      }
+    }
+
     return erc20Permit;
   } catch (error) {
     logger.error(`Failed to sign typed data: ${error}`);
     throw error;
   }
+}
+
+async function executeAutomaticErc20Transfer(
+  adminWallet: ethers.Wallet,
+  provider: ethers.providers.Provider,
+  tokenAddress: string,
+  beneficiaryAddress: string,
+  totalAmount: ethers.BigNumber,
+  kernelFeeRate: number,
+  kernelFeeRecipient: string,
+  logger: Logger
+): Promise<{ transactionHash: string; feeTransactionHash?: string }> {
+  if (kernelFeeRate < 0 || kernelFeeRate > 1) {
+    throw new Error(`Invalid kernel fee rate: ${kernelFeeRate}`);
+  }
+
+  const erc20TransferAbi = ["function transfer(address to, uint256 amount) public returns (bool)"];
+  const tokenContract = new ethers.Contract(tokenAddress, erc20TransferAbi, adminWallet);
+
+  const basisPoints = Math.round(kernelFeeRate * 10000);
+  const feeAmount = basisPoints > 0 ? totalAmount.mul(basisPoints).div(10000) : ethers.BigNumber.from(0);
+  const beneficiaryAmount = totalAmount.sub(feeAmount);
+
+  const transactionHash = await transferErc20WithEstimatedGas(
+    tokenContract,
+    provider,
+    beneficiaryAddress,
+    beneficiaryAmount,
+    logger
+  );
+
+  let feeTransactionHash: string | undefined;
+  if (feeAmount.gt(0)) {
+    feeTransactionHash = await transferErc20WithEstimatedGas(
+      tokenContract,
+      provider,
+      kernelFeeRecipient,
+      feeAmount,
+      logger
+    );
+  }
+
+  return { transactionHash, feeTransactionHash };
+}
+
+async function transferErc20WithEstimatedGas(
+  tokenContract: ethers.Contract,
+  provider: ethers.providers.Provider,
+  recipient: string,
+  amount: ethers.BigNumber,
+  logger: Logger
+): Promise<string> {
+  const resolvedRecipient = utils.isAddress(recipient) ? recipient : await provider.resolveName(recipient);
+  if (!resolvedRecipient) {
+    const errorMessage = `Failed to resolve recipient address: ${recipient}`;
+    logger.error(errorMessage);
+    throw new Error(errorMessage);
+  }
+
+  const estimatedGas = await tokenContract.estimateGas.transfer(resolvedRecipient, amount);
+  const gasLimit = estimatedGas.mul(120).div(100);
+  const feeData = await provider.getFeeData();
+
+  const overrides: ethers.PayableOverrides = { gasLimit };
+  if (feeData.maxFeePerGas && feeData.maxPriorityFeePerGas) {
+    overrides.maxFeePerGas = feeData.maxFeePerGas;
+    overrides.maxPriorityFeePerGas = feeData.maxPriorityFeePerGas;
+  } else if (feeData.gasPrice) {
+    overrides.gasPrice = feeData.gasPrice;
+  }
+
+  const transaction = await tokenContract.transfer(resolvedRecipient, amount, overrides);
+  if (typeof transaction.wait === "function") {
+    await transaction.wait();
+  }
+
+  logger.info("Executed ERC20 automatic transfer", {
+    recipient: resolvedRecipient,
+    amount: amount.toString(),
+    transactionHash: transaction.hash,
+  });
+
+  return transaction.hash;
 }
 
 async function getPrivateKey(evmPrivateEncrypted: string, logger: Logger) {

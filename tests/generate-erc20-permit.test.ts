@@ -1,7 +1,8 @@
 import { beforeEach, describe, expect, it, jest } from "@jest/globals";
+import { BigNumber, Wallet, providers, utils } from "ethers";
 import { generateErc20PermitSignature } from "../src";
 import { Context } from "../src/types/context";
-import { ERC20_REWARD_TOKEN_ADDRESS, SPENDER, mockContext } from "./constants";
+import { ERC20_REWARD_TOKEN_ADDRESS, SPENDER, WALLET_ADDRESS, mockContext } from "./constants";
 
 describe("generateErc20PermitSignature", () => {
   let context: Context;
@@ -104,5 +105,114 @@ describe("generateErc20PermitSignature", () => {
     }).rejects.toThrow();
 
     expect(context.logger.error).toHaveBeenCalledWith("ERC20 Permit generation error: Wallet not found");
+  });
+
+  it("should automatically transfer ERC20 tokens with dynamic gas estimation when transfer is enabled", async () => {
+    const amount = 100;
+    context.config.evmPrivateEncrypted = cypherText;
+    context.config.transfer = true;
+    (context.adapters.supabase.wallet.getWalletByUserId as jest.Mock).mockReturnValue(WALLET_ADDRESS);
+
+    jest.spyOn(providers.JsonRpcProvider.prototype, "getBlockNumber").mockResolvedValue(1);
+    jest.spyOn(providers.JsonRpcProvider.prototype, "call").mockResolvedValue(utils.defaultAbiCoder.encode(["uint8"], [18]));
+    jest.spyOn(providers.JsonRpcProvider.prototype, "getFeeData").mockResolvedValue({
+      gasPrice: BigNumber.from(1000000000),
+      maxFeePerGas: BigNumber.from(2000000000),
+      maxPriorityFeePerGas: BigNumber.from(100000000),
+      lastBaseFeePerGas: BigNumber.from(1000000000),
+    });
+
+    const estimateGasSpy = jest.spyOn(Wallet.prototype, "estimateGas").mockResolvedValue(BigNumber.from(50000));
+    const waitMock = jest.fn().mockImplementation(() => Promise.resolve({ logs: [] } as unknown as providers.TransactionReceipt));
+    const sendTransactionSpy = jest.spyOn(Wallet.prototype, "sendTransaction").mockResolvedValue({
+      hash: "0xbeneficiarytxhash",
+      wait: waitMock,
+    } as unknown as providers.TransactionResponse);
+
+    const result = await generateErc20PermitSignature(context, SPENDER, amount, ERC20_REWARD_TOKEN_ADDRESS);
+
+    expect(estimateGasSpy).toHaveBeenCalledTimes(1);
+    expect(sendTransactionSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        to: ERC20_REWARD_TOKEN_ADDRESS,
+        gasLimit: BigNumber.from(60000),
+        maxFeePerGas: BigNumber.from(2000000000),
+        maxPriorityFeePerGas: BigNumber.from(100000000),
+      })
+    );
+    expect(result.tokenType).toBe("ERC20");
+    if (result.tokenType === "ERC20") {
+      expect(result.transactionHash).toBe("0xbeneficiarytxhash");
+      expect(result.feeTransactionHash).toBeUndefined();
+    }
+
+    jest.restoreAllMocks();
+  });
+
+  it("should transfer kernel fee to ubq.eth when transfer and KERNEL_FEE_RATE are configured", async () => {
+    const amount = 100;
+    const resolvedKernelWallet = "0x000000000000000000000000000000000000dEaD";
+    context.config.evmPrivateEncrypted = cypherText;
+    context.config.transfer = true;
+    context.env = {
+      GITHUB_TOKEN: "token",
+      SUPABASE_URL: "https://example.supabase.co",
+      SUPABASE_KEY: "key",
+      KERNEL_FEE_RATE: "0.05",
+    };
+    (context.adapters.supabase.wallet.getWalletByUserId as jest.Mock).mockReturnValue(WALLET_ADDRESS);
+
+    jest.spyOn(providers.JsonRpcProvider.prototype, "getBlockNumber").mockResolvedValue(1);
+    jest.spyOn(providers.JsonRpcProvider.prototype, "call").mockResolvedValue(utils.defaultAbiCoder.encode(["uint8"], [18]));
+    const resolveNameSpy = jest.spyOn(providers.JsonRpcProvider.prototype, "resolveName").mockResolvedValue(resolvedKernelWallet);
+    jest.spyOn(providers.JsonRpcProvider.prototype, "getFeeData").mockResolvedValue({
+      gasPrice: BigNumber.from(1000000000),
+      maxFeePerGas: null,
+      maxPriorityFeePerGas: null,
+      lastBaseFeePerGas: null,
+    });
+
+    const estimateGasSpy = jest.spyOn(Wallet.prototype, "estimateGas").mockResolvedValue(BigNumber.from(50000));
+    const waitMock = jest.fn().mockImplementation(() => Promise.resolve({ logs: [] } as unknown as providers.TransactionReceipt));
+    const sendTransactionSpy = jest
+      .spyOn(Wallet.prototype, "sendTransaction")
+      .mockResolvedValueOnce({
+        hash: "0xbeneficiarytxhash",
+        wait: waitMock,
+      } as unknown as providers.TransactionResponse)
+      .mockResolvedValueOnce({
+        hash: "0xfeetxhash",
+        wait: waitMock,
+      } as unknown as providers.TransactionResponse);
+
+    const result = await generateErc20PermitSignature(context, SPENDER, amount, ERC20_REWARD_TOKEN_ADDRESS);
+
+    const erc20Interface = new utils.Interface(["function transfer(address to, uint256 amount) public returns (bool)"]);
+    expect(resolveNameSpy).toHaveBeenCalledWith("ubq.eth");
+    expect(estimateGasSpy).toHaveBeenCalledTimes(2);
+    expect(sendTransactionSpy).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({
+        to: ERC20_REWARD_TOKEN_ADDRESS,
+        data: erc20Interface.encodeFunctionData("transfer", [WALLET_ADDRESS, BigNumber.from("95000000000000000000")]),
+        gasLimit: BigNumber.from(60000),
+        gasPrice: BigNumber.from(1000000000),
+      })
+    );
+    expect(sendTransactionSpy).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({
+        to: ERC20_REWARD_TOKEN_ADDRESS,
+        data: erc20Interface.encodeFunctionData("transfer", [resolvedKernelWallet, BigNumber.from("5000000000000000000")]),
+        gasLimit: BigNumber.from(60000),
+        gasPrice: BigNumber.from(1000000000),
+      })
+    );
+    if (result.tokenType === "ERC20") {
+      expect(result.transactionHash).toBe("0xbeneficiarytxhash");
+      expect(result.feeTransactionHash).toBe("0xfeetxhash");
+    }
+
+    jest.restoreAllMocks();
   });
 });
